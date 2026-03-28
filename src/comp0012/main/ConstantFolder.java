@@ -3,20 +3,11 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.util.Iterator;
 
 import org.apache.bcel.classfile.ClassParser;
-import org.apache.bcel.classfile.Code;
 import org.apache.bcel.classfile.JavaClass;
 import org.apache.bcel.classfile.Method;
-import org.apache.bcel.generic.ClassGen;
-import org.apache.bcel.generic.ConstantPoolGen;
-import org.apache.bcel.generic.InstructionHandle;
-import org.apache.bcel.generic.InstructionList;
-import org.apache.bcel.util.InstructionFinder;
-import org.apache.bcel.generic.MethodGen;
-import org.apache.bcel.generic.TargetLostException;
-
+import org.apache.bcel.generic.*;
 
 
 public class ConstantFolder
@@ -37,18 +28,212 @@ public class ConstantFolder
 			e.printStackTrace();
 		}
 	}
-	
+
+	/**
+	 * Extract a numeric constant value from an instruction, or null if not a constant.
+	 */
+	private Number getConstantValue(Instruction inst, ConstantPoolGen cpgen) {
+		if (inst instanceof ConstantPushInstruction) {
+			return ((ConstantPushInstruction) inst).getValue();
+		} else if (inst instanceof LDC) {
+			Object val = ((LDC) inst).getValue(cpgen);
+			if (val instanceof Number) {
+				return (Number) val;
+			}
+		} else if (inst instanceof LDC2_W) {
+			return ((LDC2_W) inst).getValue(cpgen);
+		}
+		return null;
+	}
+
+	/**
+	 * Attempt to fold a binary arithmetic operation on two constant operands.
+	 * Returns the result, or null if the operation cannot be folded.
+	 */
+	private Number foldBinaryOp(Number val1, Number val2, Instruction op) {
+		// Integer arithmetic
+		if (op instanceof IADD) return val1.intValue() + val2.intValue();
+		if (op instanceof ISUB) return val1.intValue() - val2.intValue();
+		if (op instanceof IMUL) return val1.intValue() * val2.intValue();
+		if (op instanceof IDIV) {
+			if (val2.intValue() == 0) return null;
+			return val1.intValue() / val2.intValue();
+		}
+		if (op instanceof IREM) {
+			if (val2.intValue() == 0) return null;
+			return val1.intValue() % val2.intValue();
+		}
+
+		// Long arithmetic
+		if (op instanceof LADD) return val1.longValue() + val2.longValue();
+		if (op instanceof LSUB) return val1.longValue() - val2.longValue();
+		if (op instanceof LMUL) return val1.longValue() * val2.longValue();
+		if (op instanceof LDIV) {
+			if (val2.longValue() == 0L) return null;
+			return val1.longValue() / val2.longValue();
+		}
+		if (op instanceof LREM) {
+			if (val2.longValue() == 0L) return null;
+			return val1.longValue() % val2.longValue();
+		}
+
+		// Float arithmetic
+		if (op instanceof FADD) return val1.floatValue() + val2.floatValue();
+		if (op instanceof FSUB) return val1.floatValue() - val2.floatValue();
+		if (op instanceof FMUL) return val1.floatValue() * val2.floatValue();
+		if (op instanceof FDIV) return val1.floatValue() / val2.floatValue();
+		if (op instanceof FREM) return val1.floatValue() % val2.floatValue();
+
+		// Double arithmetic
+		if (op instanceof DADD) return val1.doubleValue() + val2.doubleValue();
+		if (op instanceof DSUB) return val1.doubleValue() - val2.doubleValue();
+		if (op instanceof DMUL) return val1.doubleValue() * val2.doubleValue();
+		if (op instanceof DDIV) return val1.doubleValue() / val2.doubleValue();
+		if (op instanceof DREM) return val1.doubleValue() % val2.doubleValue();
+
+		// Comparison operations (result is always int)
+		if (op instanceof LCMP) {
+			long l1 = val1.longValue(), l2 = val2.longValue();
+			return (l1 > l2) ? 1 : (l1 == l2) ? 0 : -1;
+		}
+		if (op instanceof FCMPL || op instanceof FCMPG) {
+			float f1 = val1.floatValue(), f2 = val2.floatValue();
+			if (Float.isNaN(f1) || Float.isNaN(f2)) {
+				return (op instanceof FCMPL) ? -1 : 1;
+			}
+			return (f1 > f2) ? 1 : (f1 == f2) ? 0 : -1;
+		}
+		if (op instanceof DCMPL || op instanceof DCMPG) {
+			double d1 = val1.doubleValue(), d2 = val2.doubleValue();
+			if (Double.isNaN(d1) || Double.isNaN(d2)) {
+				return (op instanceof DCMPL) ? -1 : 1;
+			}
+			return (d1 > d2) ? 1 : (d1 == d2) ? 0 : -1;
+		}
+
+		return null;
+	}
+
+	/**
+	 * Create a push instruction for the folded result, matching the result type of the operation.
+	 */
+	private Instruction createPushInstruction(Number value, Instruction op, ConstantPoolGen cpgen) {
+		// Operations that produce int results
+		if (op instanceof IADD || op instanceof ISUB || op instanceof IMUL ||
+			op instanceof IDIV || op instanceof IREM ||
+			op instanceof LCMP || op instanceof FCMPL || op instanceof FCMPG ||
+			op instanceof DCMPL || op instanceof DCMPG) {
+			return pushInt(value.intValue(), cpgen);
+		}
+		// Operations that produce long results
+		if (op instanceof LADD || op instanceof LSUB || op instanceof LMUL ||
+			op instanceof LDIV || op instanceof LREM) {
+			return pushLong(value.longValue(), cpgen);
+		}
+		// Operations that produce float results
+		if (op instanceof FADD || op instanceof FSUB || op instanceof FMUL ||
+			op instanceof FDIV || op instanceof FREM) {
+			return pushFloat(value.floatValue(), cpgen);
+		}
+		// Operations that produce double results
+		if (op instanceof DADD || op instanceof DSUB || op instanceof DMUL ||
+			op instanceof DDIV || op instanceof DREM) {
+			return pushDouble(value.doubleValue(), cpgen);
+		}
+		return null;
+	}
+
+	private Instruction pushInt(int value, ConstantPoolGen cpgen) {
+		if (value >= -1 && value <= 5) return new ICONST(value);
+		if (value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE) return new BIPUSH((byte) value);
+		if (value >= Short.MIN_VALUE && value <= Short.MAX_VALUE) return new SIPUSH((short) value);
+		return new LDC(cpgen.addInteger(value));
+	}
+
+	private Instruction pushLong(long value, ConstantPoolGen cpgen) {
+		if (value == 0L) return new LCONST(0);
+		if (value == 1L) return new LCONST(1);
+		return new LDC2_W(cpgen.addLong(value));
+	}
+
+	private Instruction pushFloat(float value, ConstantPoolGen cpgen) {
+		// Use LDC for all float values to avoid edge cases with FCONST and negative zero
+		return new LDC(cpgen.addFloat(value));
+	}
+
+	private Instruction pushDouble(double value, ConstantPoolGen cpgen) {
+		// Use LDC2_W for all double values to avoid edge cases with DCONST and negative zero
+		return new LDC2_W(cpgen.addDouble(value));
+	}
+
+	private void safeDelete(InstructionList il, InstructionHandle from, InstructionHandle to, InstructionHandle redirectTo) {
+		try {
+			il.delete(from, to);
+		} catch (TargetLostException e) {
+			for (InstructionHandle target : e.getTargets()) {
+				for (InstructionTargeter targeter : target.getTargeters()) {
+					targeter.updateTarget(target, redirectTo);
+				}
+			}
+		}
+	}
+
 	public void optimize()
 	{
 		ClassGen cgen = new ClassGen(original);
 		ConstantPoolGen cpgen = cgen.getConstantPool();
 
-		// Implement your optimization here
-        
-		this.optimized = gen.getJavaClass();
+		Method[] methods = cgen.getMethods();
+		for (Method method : methods) {
+			if (method.getCode() == null) continue;
+
+			MethodGen mg = new MethodGen(method, cgen.getClassName(), cpgen);
+			InstructionList il = mg.getInstructionList();
+
+			foldConstants(il, cpgen);
+
+			mg.setMaxStack();
+			mg.setMaxLocals();
+			cgen.replaceMethod(method, mg.getMethod());
+		}
+
+		this.optimized = cgen.getJavaClass();
 	}
 
-	
+	/**
+	 * Simple constant folding: find patterns of (const, const, arithmetic_op)
+	 * and replace with the computed result. Repeats until no more folding is possible.
+	 */
+	private void foldConstants(InstructionList il, ConstantPoolGen cpgen) {
+		boolean changed = true;
+		while (changed) {
+			changed = false;
+			InstructionHandle[] handles = il.getInstructionHandles();
+			for (int i = 0; i < handles.length - 2; i++) {
+				Number val1 = getConstantValue(handles[i].getInstruction(), cpgen);
+				if (val1 == null) continue;
+
+				Number val2 = getConstantValue(handles[i + 1].getInstruction(), cpgen);
+				if (val2 == null) continue;
+
+				Instruction arithInst = handles[i + 2].getInstruction();
+				Number result = foldBinaryOp(val1, val2, arithInst);
+				if (result == null) continue;
+
+				Instruction newInst = createPushInstruction(result, arithInst, cpgen);
+				if (newInst == null) continue;
+
+				// Replace the first instruction with the folded constant
+				handles[i].setInstruction(newInst);
+				// Delete the second constant and the arithmetic operation
+				safeDelete(il, handles[i + 1], handles[i + 2], handles[i]);
+				changed = true;
+				break; // restart scan since handles are now stale
+			}
+		}
+	}
+
+
 	public void write(String optimisedFilePath)
 	{
 		this.optimize();
