@@ -3,6 +3,8 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 import org.apache.bcel.classfile.ClassParser;
 import org.apache.bcel.classfile.JavaClass;
@@ -214,9 +216,19 @@ public class ConstantFolder
 			MethodGen mg = new MethodGen(method, cgen.getClassName(), cpgen);
 			InstructionList il = mg.getInstructionList();
 
-			foldConstants(il, cpgen);
+			// Fixed-point iteration: propagate constant variables then fold,
+			// repeat until no more changes (handles chained dependencies like b = a - 1234)
+			boolean changed = true;
+			int iterations = 0;
+			while (changed && iterations < 100) {
+				changed = false;
+				if (propagateConstantVariables(il, cpgen)) changed = true;
+				if (foldConstants(il, cpgen)) changed = true;
+				iterations++;
+			}
 
 			// update method back to class
+			mg.removeCodeAttributes();
 			mg.setMaxStack();
 			mg.setMaxLocals();
 			cgen.replaceMethod(method, mg.getMethod());
@@ -226,10 +238,102 @@ public class ConstantFolder
 	}
 
 	/**
+	 * SUBGOAL 2 (Hyunwoo): Propagate constant variables.
+	 * Finds local variables that are assigned exactly once (and not modified by IINC),
+	 * where the stored value is a constant. Replaces all loads of that variable
+	 * with the constant value.
+	 *
+	 * Returns true if any changes were made.
+	 */
+	private boolean propagateConstantVariables(InstructionList il, ConstantPoolGen cpgen) {
+		boolean changed = false;
+		InstructionHandle[] handles = il.getInstructionHandles();
+ 
+		// Step 1: Count how many times each local variable index is stored to,
+		// and record the constant value if the instruction before store is a constant push.
+		// Also check for IINC which directly mutates a variable without load/store.
+		Map<Integer, Integer> storeCount = new HashMap<>();
+		Map<Integer, Number> storeValue = new HashMap<>();
+ 
+		for (int i = 0; i < handles.length; i++) {
+			Instruction inst = handles[i].getInstruction();
+ 
+			if (inst instanceof StoreInstruction) {
+				int index = ((StoreInstruction) inst).getIndex();
+				storeCount.put(index, storeCount.getOrDefault(index, 0) + 1);
+ 
+				// Check if the instruction before the store is a constant push
+				if (i > 0) {
+					Number val = getConstantValue(handles[i - 1].getInstruction(), cpgen);
+					if (val != null) {
+						storeValue.put(index, val);
+					} else {
+						// Not a constant store, remove any previously recorded value
+						storeValue.remove(index);
+					}
+				}
+			}
+ 
+			// IINC directly mutates a local variable, so disqualify it
+			if (inst instanceof IINC) {
+				int index = ((IINC) inst).getIndex();
+				storeCount.put(index, storeCount.getOrDefault(index, 0) + 2);
+			}
+		}
+ 
+		// Step 2: For variables stored exactly once with a known constant value,
+		// replace all loads of that variable with the constant push.
+		for (Map.Entry<Integer, Integer> entry : storeCount.entrySet()) {
+			int varIndex = entry.getKey();
+			int count = entry.getValue();
+ 
+			if (count != 1 || !storeValue.containsKey(varIndex)) continue;
+ 
+			Number constVal = storeValue.get(varIndex);
+ 
+			// Find the store instruction to determine the variable type
+			Instruction storeInst = null;
+			for (InstructionHandle h : handles) {
+				if (h.getInstruction() instanceof StoreInstruction &&
+					((StoreInstruction) h.getInstruction()).getIndex() == varIndex) {
+					storeInst = h.getInstruction();
+					break;
+				}
+			}
+			if (storeInst == null) continue;
+ 
+			// Replace all loads of this variable with a constant push
+			for (InstructionHandle h : il.getInstructionHandles()) {
+				if (h.getInstruction() instanceof LoadInstruction &&
+					((LoadInstruction) h.getInstruction()).getIndex() == varIndex) {
+					h.setInstruction(createTypedPushInstruction(constVal, storeInst, cpgen));
+					changed = true;
+				}
+			}
+		}
+ 
+		return changed;
+	}
+ 
+	/**
+	 * Helper for sub-goal 2:
+	 * Create a push instruction matching the type of the store instruction.
+	 */
+	private Instruction createTypedPushInstruction(Number value, Instruction storeInst, ConstantPoolGen cpgen) {
+		if (storeInst instanceof ISTORE) return pushInt(value.intValue(), cpgen);
+		if (storeInst instanceof LSTORE) return pushLong(value.longValue(), cpgen);
+		if (storeInst instanceof FSTORE) return pushFloat(value.floatValue(), cpgen);
+		if (storeInst instanceof DSTORE) return pushDouble(value.doubleValue(), cpgen);
+		return null;
+	}
+ 
+
+	/**
 	 * SUBGOAL 1 (Declan): Performs simple constant folding: find patterns of (const, const, arithmetic_op)
 	 * and replace with the computed result. Repeats until no more folding is possible.
 	 */
-	private void foldConstants(InstructionList il, ConstantPoolGen cpgen) {
+	private boolean foldConstants(InstructionList il, ConstantPoolGen cpgen) {
+		boolean anyChanged = false;
 		boolean changed = true;
 
 		// keep running until a full pass finds nothing to fold
@@ -258,9 +362,11 @@ public class ConstantFolder
 				// delete the second constant and the arithmetic operation
 				safeDelete(il, handles[i + 1], handles[i + 2], handles[i]);
 				changed = true;
+				anyChanged = true;
 				break; // restart scan since handles are now stale
 			}
 		}
+		return anyChanged;
 	}
 
 
