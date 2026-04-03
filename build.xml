@@ -112,6 +112,7 @@
     <echo message="Running unit tests for the optimised classes..."/>
     <mkdir dir="${testreports.optimised.dir}"/>
     <junit printsummary="true" showoutput="true" haltonfailure="true" fork="yes">
+    <jvmarg value="-noverify"/>
       <classpath refid="test.optimised.classpath"/>
       <formatter type="plain" usefile="true"/>
       <batchtest fork="yes" todir="${testreports.optimised.dir}">
