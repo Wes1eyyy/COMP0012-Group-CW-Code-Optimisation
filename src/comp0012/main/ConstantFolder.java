@@ -4,7 +4,9 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.bcel.classfile.ClassParser;
 import org.apache.bcel.classfile.JavaClass;
@@ -223,6 +225,7 @@ public class ConstantFolder
 			while (changed && iterations < 100) {
 				changed = false;
 				if (propagateConstantVariables(il, cpgen)) changed = true;
+				if (propagateDynamicVariables(il, cpgen)) changed = true;
 				if (foldConstants(il, cpgen)) changed = true;
 				iterations++;
 			}
@@ -248,20 +251,20 @@ public class ConstantFolder
 	private boolean propagateConstantVariables(InstructionList il, ConstantPoolGen cpgen) {
 		boolean changed = false;
 		InstructionHandle[] handles = il.getInstructionHandles();
- 
+
 		// Step 1: Count how many times each local variable index is stored to,
 		// and record the constant value if the instruction before store is a constant push.
 		// Also check for IINC which directly mutates a variable without load/store.
 		Map<Integer, Integer> storeCount = new HashMap<>();
 		Map<Integer, Number> storeValue = new HashMap<>();
- 
+
 		for (int i = 0; i < handles.length; i++) {
 			Instruction inst = handles[i].getInstruction();
- 
+
 			if (inst instanceof StoreInstruction) {
 				int index = ((StoreInstruction) inst).getIndex();
 				storeCount.put(index, storeCount.getOrDefault(index, 0) + 1);
- 
+
 				// Check if the instruction before the store is a constant push
 				if (i > 0) {
 					Number val = getConstantValue(handles[i - 1].getInstruction(), cpgen);
@@ -273,24 +276,24 @@ public class ConstantFolder
 					}
 				}
 			}
- 
+
 			// IINC directly mutates a local variable, so disqualify it
 			if (inst instanceof IINC) {
 				int index = ((IINC) inst).getIndex();
 				storeCount.put(index, storeCount.getOrDefault(index, 0) + 2);
 			}
 		}
- 
+
 		// Step 2: For variables stored exactly once with a known constant value,
 		// replace all loads of that variable with the constant push.
 		for (Map.Entry<Integer, Integer> entry : storeCount.entrySet()) {
 			int varIndex = entry.getKey();
 			int count = entry.getValue();
- 
+
 			if (count != 1 || !storeValue.containsKey(varIndex)) continue;
- 
+
 			Number constVal = storeValue.get(varIndex);
- 
+
 			// Find the store instruction to determine the variable type
 			Instruction storeInst = null;
 			for (InstructionHandle h : handles) {
@@ -301,7 +304,7 @@ public class ConstantFolder
 				}
 			}
 			if (storeInst == null) continue;
- 
+
 			// Replace all loads of this variable with a constant push
 			for (InstructionHandle h : il.getInstructionHandles()) {
 				if (h.getInstruction() instanceof LoadInstruction &&
@@ -311,10 +314,10 @@ public class ConstantFolder
 				}
 			}
 		}
- 
+
 		return changed;
 	}
- 
+
 	/**
 	 * Helper for sub-goal 2:
 	 * Create a push instruction matching the type of the store instruction.
@@ -326,7 +329,119 @@ public class ConstantFolder
 		if (storeInst instanceof DSTORE) return pushDouble(value.doubleValue(), cpgen);
 		return null;
 	}
- 
+
+
+	/**
+	 * SUBGOAL 3: Propagate dynamic variables.
+	 * Handles variables reassigned multiple times with constant values, propagating
+	 * the correct value within each interval between assignments.
+	 * Variables are invalidated at branch targets if modified within the branched region.
+	 *
+	 * Returns true if any changes were made.
+	 */
+	private boolean propagateDynamicVariables(InstructionList il, ConstantPoolGen cpgen) {
+		boolean changed = false;
+		InstructionHandle[] handles = il.getInstructionHandles();
+
+		// For each branch, find variables modified between the branch and its target.
+		// These must be invalidated at the target (e.g. loop variables that change each iteration).
+		Map<InstructionHandle, Set<Integer>> invalidateAtTarget = new HashMap<>();
+		for (InstructionHandle h : handles) {
+			Instruction inst = h.getInstruction();
+			if (inst instanceof BranchInstruction) {
+				InstructionHandle target = ((BranchInstruction) inst).getTarget();
+				collectModifiedVarsBetween(h, target, invalidateAtTarget);
+				if (inst instanceof Select) {
+					for (InstructionHandle t : ((Select) inst).getTargets()) {
+						collectModifiedVarsBetween(h, t, invalidateAtTarget);
+					}
+				}
+			}
+		}
+
+		Map<Integer, Number> varValues = new HashMap<>();
+		Map<Integer, Instruction> varStoreType = new HashMap<>();
+
+		for (InstructionHandle h : handles) {
+			Instruction inst = h.getInstruction();
+
+			// Invalidate variables whose value may differ across paths at this join point
+			if (invalidateAtTarget.containsKey(h)) {
+				for (int idx : invalidateAtTarget.get(h)) {
+					varValues.remove(idx);
+					varStoreType.remove(idx);
+				}
+			}
+
+			if (inst instanceof LoadInstruction) {
+				int index = ((LoadInstruction) inst).getIndex();
+				if (varValues.containsKey(index) && varStoreType.containsKey(index)) {
+					Instruction push = createTypedPushInstruction(varValues.get(index), varStoreType.get(index), cpgen);
+					if (push != null) {
+						h.setInstruction(push);
+						changed = true;
+					}
+				}
+			}
+
+			if (inst instanceof StoreInstruction) {
+				int index = ((StoreInstruction) inst).getIndex();
+				InstructionHandle prev = h.getPrev();
+				if (prev != null) {
+					Number val = getConstantValue(prev.getInstruction(), cpgen);
+					if (val != null) {
+						varValues.put(index, val);
+						varStoreType.put(index, inst);
+					} else {
+						varValues.remove(index);
+						varStoreType.remove(index);
+					}
+				} else {
+					varValues.remove(index);
+					varStoreType.remove(index);
+				}
+			}
+
+			if (inst instanceof IINC) {
+				int index = ((IINC) inst).getIndex();
+				varValues.remove(index);
+				varStoreType.remove(index);
+			}
+		}
+
+		return changed;
+	}
+
+	/**
+	 * Helper for sub-goal 3:
+	 * Collects variables stored or IINC'd between a branch and its target (either direction),
+	 * adding them to the invalidation set for the target.
+	 */
+	private void collectModifiedVarsBetween(InstructionHandle branchHandle, InstructionHandle target,
+											Map<InstructionHandle, Set<Integer>> invalidateAtTarget) {
+		InstructionHandle start, end;
+		if (target.getPosition() <= branchHandle.getPosition()) {
+			start = target;
+			end = branchHandle;
+		} else {
+			start = branchHandle;
+			end = target;
+		}
+
+		Set<Integer> modifiedVars = new HashSet<>();
+		for (InstructionHandle scan = start; scan != null && scan != end.getNext(); scan = scan.getNext()) {
+			if (scan.getInstruction() instanceof StoreInstruction) {
+				modifiedVars.add(((StoreInstruction) scan.getInstruction()).getIndex());
+			}
+			if (scan.getInstruction() instanceof IINC) {
+				modifiedVars.add(((IINC) scan.getInstruction()).getIndex());
+			}
+		}
+
+		if (!modifiedVars.isEmpty()) {
+			invalidateAtTarget.merge(target, modifiedVars, (a, b) -> { a.addAll(b); return a; });
+		}
+	}
 
 	/**
 	 * SUBGOAL 1 (Declan): Performs simple constant folding: find patterns of (const, const, arithmetic_op)
@@ -356,7 +471,7 @@ public class ConstantFolder
 				Instruction newInst = createPushInstruction(result, arithInst, cpgen);
 				if (newInst == null) continue;
 
-				// we found the pattern 
+				// we found the pattern
 				// replace the first instruction with the folded constant
 				handles[i].setInstruction(newInst);
 				// delete the second constant and the arithmetic operation
