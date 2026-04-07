@@ -33,19 +33,36 @@ public class ConstantFolder
 		}
 	}
 
+	/**
+	 * Helper function for sub-goal 1:
+	 * Extract a numeric constant value from an instruction, or null if not a constant.
+	 */
 	private Number getConstantValue(Instruction inst, ConstantPoolGen cpgen) {
+		// get the value if a constant push instruction is passed as value is
+		// directly encoded in instruction itself
 		if (inst instanceof ConstantPushInstruction) {
 			return ((ConstantPushInstruction) inst).getValue();
-		} else if (inst instanceof LDC) {
+		} else if (inst instanceof LDC) { // constant from constant fpool for ints/floats
 			Object val = ((LDC) inst).getValue(cpgen);
-			if (val instanceof Number) return (Number) val;
-		} else if (inst instanceof LDC2_W) {
+			if (val instanceof Number) {
+				return (Number) val;
+			}
+		} else if (inst instanceof LDC2_W) { // wide constant for longs/doubles
 			return ((LDC2_W) inst).getValue(cpgen);
 		}
 		return null;
 	}
 
+	/**
+	 * Helper function for sub-goal 1:
+	 * Attempt to fold a binary arithmetic operation on two constant operands.
+	 * Returns the result, or null if the operation cannot be folded.
+	 * It handles all 4 types (int, log, float, double) and its operations
+	 * including comparsion operations. It returns null if the
+	 * operation is not recognised or if the operation cause a divide by 0 error.
+	 */
 	private Number foldBinaryOp(Number val1, Number val2, Instruction op) {
+		// integer arithmetic
 		if (op instanceof IADD) return val1.intValue() + val2.intValue();
 		if (op instanceof ISUB) return val1.intValue() - val2.intValue();
 		if (op instanceof IMUL) return val1.intValue() * val2.intValue();
@@ -57,6 +74,8 @@ public class ConstantFolder
 			if (val2.intValue() == 0) return null;
 			return val1.intValue() % val2.intValue();
 		}
+
+		// long arithmetic
 		if (op instanceof LADD) return val1.longValue() + val2.longValue();
 		if (op instanceof LSUB) return val1.longValue() - val2.longValue();
 		if (op instanceof LMUL) return val1.longValue() * val2.longValue();
@@ -68,48 +87,68 @@ public class ConstantFolder
 			if (val2.longValue() == 0L) return null;
 			return val1.longValue() % val2.longValue();
 		}
+
+		// float arithmetic
 		if (op instanceof FADD) return val1.floatValue() + val2.floatValue();
 		if (op instanceof FSUB) return val1.floatValue() - val2.floatValue();
 		if (op instanceof FMUL) return val1.floatValue() * val2.floatValue();
 		if (op instanceof FDIV) return val1.floatValue() / val2.floatValue();
 		if (op instanceof FREM) return val1.floatValue() % val2.floatValue();
+
+		// double arithmetic
 		if (op instanceof DADD) return val1.doubleValue() + val2.doubleValue();
 		if (op instanceof DSUB) return val1.doubleValue() - val2.doubleValue();
 		if (op instanceof DMUL) return val1.doubleValue() * val2.doubleValue();
 		if (op instanceof DDIV) return val1.doubleValue() / val2.doubleValue();
 		if (op instanceof DREM) return val1.doubleValue() % val2.doubleValue();
+
+		// comparison operations (result is always int)
 		if (op instanceof LCMP) {
 			long l1 = val1.longValue(), l2 = val2.longValue();
 			return (l1 > l2) ? 1 : (l1 == l2) ? 0 : -1;
 		}
 		if (op instanceof FCMPL || op instanceof FCMPG) {
 			float f1 = val1.floatValue(), f2 = val2.floatValue();
-			if (Float.isNaN(f1) || Float.isNaN(f2)) return (op instanceof FCMPL) ? -1 : 1;
+			if (Float.isNaN(f1) || Float.isNaN(f2)) {
+				return (op instanceof FCMPL) ? -1 : 1;
+			}
 			return (f1 > f2) ? 1 : (f1 == f2) ? 0 : -1;
 		}
 		if (op instanceof DCMPL || op instanceof DCMPG) {
 			double d1 = val1.doubleValue(), d2 = val2.doubleValue();
-			if (Double.isNaN(d1) || Double.isNaN(d2)) return (op instanceof DCMPL) ? -1 : 1;
+			if (Double.isNaN(d1) || Double.isNaN(d2)) {
+				return (op instanceof DCMPL) ? -1 : 1;
+			}
 			return (d1 > d2) ? 1 : (d1 == d2) ? 0 : -1;
 		}
+
 		return null;
 	}
 
+	/**
+	 * Helper function for sub-goal 1:
+	 * Create a push instruction for the folded result, matching the result type of the operation.
+	 * It takes in a folded result and figures out what type of push instruction to emit based on original operation.
+	 */
 	private Instruction createPushInstruction(Number value, Instruction op, ConstantPoolGen cpgen) {
+		// operations that produce int results - call pushInt
 		if (op instanceof IADD || op instanceof ISUB || op instanceof IMUL ||
 			op instanceof IDIV || op instanceof IREM ||
 			op instanceof LCMP || op instanceof FCMPL || op instanceof FCMPG ||
 			op instanceof DCMPL || op instanceof DCMPG) {
 			return pushInt(value.intValue(), cpgen);
 		}
+		// operations that produce long results - call pushLong
 		if (op instanceof LADD || op instanceof LSUB || op instanceof LMUL ||
 			op instanceof LDIV || op instanceof LREM) {
 			return pushLong(value.longValue(), cpgen);
 		}
+		// operations that produce float results - call pushFloat
 		if (op instanceof FADD || op instanceof FSUB || op instanceof FMUL ||
 			op instanceof FDIV || op instanceof FREM) {
 			return pushFloat(value.floatValue(), cpgen);
 		}
+		// operations that produce double results - pushDouble
 		if (op instanceof DADD || op instanceof DSUB || op instanceof DMUL ||
 			op instanceof DDIV || op instanceof DREM) {
 			return pushDouble(value.doubleValue(), cpgen);
@@ -117,7 +156,9 @@ public class ConstantFolder
 		return null;
 	}
 
+	// Helper instructions for sub-goal 1: handle push operations based on the data type
 	private Instruction pushInt(int value, ConstantPoolGen cpgen) {
+		// ICONST for -1 to 5, BIPUSH for byte-range values, SIPUSH for short-range and LDC for everything else
 		if (value >= -1 && value <= 5) return new ICONST(value);
 		if (value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE) return new BIPUSH((byte) value);
 		if (value >= Short.MIN_VALUE && value <= Short.MAX_VALUE) return new SIPUSH((short) value);
@@ -125,20 +166,32 @@ public class ConstantFolder
 	}
 
 	private Instruction pushLong(long value, ConstantPoolGen cpgen) {
+		// pushLong has only 2 as bytecode spec only defines LCONST_0 and LCONST_1 as special cases
+		// LCONST for 0L/1L (baked directly into instruction hence no constant pool needed)
 		if (value == 0L) return new LCONST(0);
 		if (value == 1L) return new LCONST(1);
+
+		// for everything else as it stores long value in constant pool and references it by index
 		return new LDC2_W(cpgen.addLong(value));
 	}
 
 	private Instruction pushFloat(float value, ConstantPoolGen cpgen) {
+		// use LDC for all float values to avoid edge cases with FCONST and negative zero
 		return new LDC(cpgen.addFloat(value));
 	}
 
 	private Instruction pushDouble(double value, ConstantPoolGen cpgen) {
+		// use LDC2_W for all double values to avoid edge cases with DCONST and negative zero
 		return new LDC2_W(cpgen.addDouble(value));
 	}
 
+
+	/**
+	* Helper function for sub-goal 1:
+	*/
 	private void safeDelete(InstructionList il, InstructionHandle from, InstructionHandle to, InstructionHandle redirectTo) {
+		// tries to delete range of instructions from instruction list, but handles the case where some other instruction was pointing
+		// to one of the deleted instructions where it will redirect those targets to `redirectTo` instead of crashing (TargetLostException)
 		try {
 			il.delete(from, to);
 		} catch (TargetLostException e) {
@@ -155,13 +208,18 @@ public class ConstantFolder
 		ClassGen cgen = new ClassGen(original);
 		ConstantPoolGen cpgen = cgen.getConstantPool();
 
+		// Implement your optimisation here
+
 		Method[] methods = cgen.getMethods();
 		for (Method method : methods) {
 			if (method.getCode() == null) continue;
 
+			// build a MethodGen and get instruction list, before calling foldConstant
 			MethodGen mg = new MethodGen(method, cgen.getClassName(), cpgen);
 			InstructionList il = mg.getInstructionList();
 
+			// Fixed-point iteration: propagate constant variables then fold,
+			// repeat until no more changes (handles chained dependencies like b = a - 1234)
 			boolean changed = true;
 			int iterations = 0;
 			while (changed && iterations < 100) {
@@ -172,6 +230,7 @@ public class ConstantFolder
 				iterations++;
 			}
 
+			// update method back to class
 			mg.removeCodeAttributes();
 			mg.setMaxStack();
 			mg.setMaxLocals();
@@ -181,11 +240,21 @@ public class ConstantFolder
 		this.optimized = cgen.getJavaClass();
 	}
 
-	// SUBGOAL 2: propagate variables assigned exactly once with a constant value
+	/**
+	 * SUBGOAL 2 (Hyunwoo): Propagate constant variables.
+	 * Finds local variables that are assigned exactly once (and not modified by IINC),
+	 * where the stored value is a constant. Replaces all loads of that variable
+	 * with the constant value.
+	 *
+	 * Returns true if any changes were made.
+	 */
 	private boolean propagateConstantVariables(InstructionList il, ConstantPoolGen cpgen) {
 		boolean changed = false;
 		InstructionHandle[] handles = il.getInstructionHandles();
 
+		// Step 1: Count how many times each local variable index is stored to,
+		// and record the constant value if the instruction before store is a constant push.
+		// Also check for IINC which directly mutates a variable without load/store.
 		Map<Integer, Integer> storeCount = new HashMap<>();
 		Map<Integer, Number> storeValue = new HashMap<>();
 
@@ -196,28 +265,36 @@ public class ConstantFolder
 				int index = ((StoreInstruction) inst).getIndex();
 				storeCount.put(index, storeCount.getOrDefault(index, 0) + 1);
 
+				// Check if the instruction before the store is a constant push
 				if (i > 0) {
 					Number val = getConstantValue(handles[i - 1].getInstruction(), cpgen);
 					if (val != null) {
 						storeValue.put(index, val);
 					} else {
+						// Not a constant store, remove any previously recorded value
 						storeValue.remove(index);
 					}
 				}
 			}
 
+			// IINC directly mutates a local variable, so disqualify it
 			if (inst instanceof IINC) {
 				int index = ((IINC) inst).getIndex();
 				storeCount.put(index, storeCount.getOrDefault(index, 0) + 2);
 			}
 		}
 
+		// Step 2: For variables stored exactly once with a known constant value,
+		// replace all loads of that variable with the constant push.
 		for (Map.Entry<Integer, Integer> entry : storeCount.entrySet()) {
 			int varIndex = entry.getKey();
-			if (entry.getValue() != 1 || !storeValue.containsKey(varIndex)) continue;
+			int count = entry.getValue();
+
+			if (count != 1 || !storeValue.containsKey(varIndex)) continue;
 
 			Number constVal = storeValue.get(varIndex);
 
+			// Find the store instruction to determine the variable type
 			Instruction storeInst = null;
 			for (InstructionHandle h : handles) {
 				if (h.getInstruction() instanceof StoreInstruction &&
@@ -228,6 +305,7 @@ public class ConstantFolder
 			}
 			if (storeInst == null) continue;
 
+			// Replace all loads of this variable with a constant push
 			for (InstructionHandle h : il.getInstructionHandles()) {
 				if (h.getInstruction() instanceof LoadInstruction &&
 					((LoadInstruction) h.getInstruction()).getIndex() == varIndex) {
@@ -240,6 +318,10 @@ public class ConstantFolder
 		return changed;
 	}
 
+	/**
+	 * Helper for sub-goal 2:
+	 * Create a push instruction matching the type of the store instruction.
+	 */
 	private Instruction createTypedPushInstruction(Number value, Instruction storeInst, ConstantPoolGen cpgen) {
 		if (storeInst instanceof ISTORE) return pushInt(value.intValue(), cpgen);
 		if (storeInst instanceof LSTORE) return pushLong(value.longValue(), cpgen);
@@ -248,13 +330,21 @@ public class ConstantFolder
 		return null;
 	}
 
-	// SUBGOAL 3: propagate variables reassigned multiple times, within each constant-value interval
+
+	/**
+	 * SUBGOAL 3: Propagate dynamic variables.
+	 * Handles variables reassigned multiple times with constant values, propagating
+	 * the correct value within each interval between assignments.
+	 * Variables are invalidated at branch targets if modified within the branched region.
+	 *
+	 * Returns true if any changes were made.
+	 */
 	private boolean propagateDynamicVariables(InstructionList il, ConstantPoolGen cpgen) {
 		boolean changed = false;
 		InstructionHandle[] handles = il.getInstructionHandles();
 
-		// For each branch, variables modified between the branch and its target must be
-		// invalidated at the target (they could differ across paths, e.g. inside a loop)
+		// For each branch, find variables modified between the branch and its target.
+		// These must be invalidated at the target (e.g. loop variables that change each iteration).
 		Map<InstructionHandle, Set<Integer>> invalidateAtTarget = new HashMap<>();
 		for (InstructionHandle h : handles) {
 			Instruction inst = h.getInstruction();
@@ -275,6 +365,7 @@ public class ConstantFolder
 		for (InstructionHandle h : handles) {
 			Instruction inst = h.getInstruction();
 
+			// Invalidate variables whose value may differ across paths at this join point
 			if (invalidateAtTarget.containsKey(h)) {
 				for (int idx : invalidateAtTarget.get(h)) {
 					varValues.remove(idx);
@@ -321,6 +412,11 @@ public class ConstantFolder
 		return changed;
 	}
 
+	/**
+	 * Helper for sub-goal 3:
+	 * Collects variables stored or IINC'd between a branch and its target (either direction),
+	 * adding them to the invalidation set for the target.
+	 */
 	private void collectModifiedVarsBetween(InstructionHandle branchHandle, InstructionHandle target,
 											Map<InstructionHandle, Set<Integer>> invalidateAtTarget) {
 		InstructionHandle start, end;
@@ -347,15 +443,20 @@ public class ConstantFolder
 		}
 	}
 
-	// SUBGOAL 1: fold (const, const, arithmetic_op) triplets into a single constant
+	/**
+	 * SUBGOAL 1 (Declan): Performs simple constant folding: find patterns of (const, const, arithmetic_op)
+	 * and replace with the computed result. Repeats until no more folding is possible.
+	 */
 	private boolean foldConstants(InstructionList il, ConstantPoolGen cpgen) {
 		boolean anyChanged = false;
 		boolean changed = true;
 
+		// keep running until a full pass finds nothing to fold
 		while (changed) {
 			changed = false;
 			InstructionHandle[] handles = il.getInstructionHandles();
 
+			// keep scanning the instruction list looking for 3 instruction pattern (const, const, arithmetic operation)
 			for (int i = 0; i < handles.length - 2; i++) {
 				Number val1 = getConstantValue(handles[i].getInstruction(), cpgen);
 				if (val1 == null) continue;
@@ -370,11 +471,14 @@ public class ConstantFolder
 				Instruction newInst = createPushInstruction(result, arithInst, cpgen);
 				if (newInst == null) continue;
 
+				// we found the pattern
+				// replace the first instruction with the folded constant
 				handles[i].setInstruction(newInst);
+				// delete the second constant and the arithmetic operation
 				safeDelete(il, handles[i + 1], handles[i + 2], handles[i]);
 				changed = true;
 				anyChanged = true;
-				break;
+				break; // restart scan since handles are now stale
 			}
 		}
 		return anyChanged;
@@ -389,8 +493,10 @@ public class ConstantFolder
 			FileOutputStream out = new FileOutputStream(new File(optimisedFilePath));
 			this.optimized.dump(out);
 		} catch (FileNotFoundException e) {
+			// Auto-generated catch block
 			e.printStackTrace();
 		} catch (IOException e) {
+			// Auto-generated catch block
 			e.printStackTrace();
 		}
 	}
