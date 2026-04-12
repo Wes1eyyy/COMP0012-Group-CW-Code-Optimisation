@@ -226,6 +226,7 @@ public class ConstantFolder
 				changed = false;
 				if (propagateConstantVariables(il, cpgen)) changed = true;
 				if (propagateDynamicVariables(il, cpgen)) changed = true;
+				if (simplifyConstantBranches(il, cpgen)) changed = true;
 				if (foldConstants(il, cpgen)) changed = true;
 				iterations++;
 			}
@@ -441,6 +442,105 @@ public class ConstantFolder
 		if (!modifiedVars.isEmpty()) {
 			invalidateAtTarget.merge(target, modifiedVars, (a, b) -> { a.addAll(b); return a; });
 		}
+	}
+
+	/**
+	 * SUBGOAL 4: Additional peephole optimisation.
+	 *
+	 * Simplify conditional branches whose operands are compile-time constants:
+	 *  - const, IF*            -> GOTO target (always true) or remove branch (always false)
+	 *  - const, const, IF_ICMP* -> GOTO target (always true) or remove branch (always false)
+	 *
+	 * Returns true if any changes were made.
+	 */
+	private boolean simplifyConstantBranches(InstructionList il, ConstantPoolGen cpgen) {
+		boolean changedAny = false;
+		boolean changed = true;
+
+		while (changed) {
+			changed = false;
+			InstructionHandle[] handles = il.getInstructionHandles();
+
+			for (int i = 0; i < handles.length; i++) {
+				Instruction inst = handles[i].getInstruction();
+
+				if (!(inst instanceof IfInstruction)) continue;
+
+				IfInstruction ifInst = (IfInstruction) inst;
+				InstructionHandle target = ifInst.getTarget();
+				InstructionHandle fallthrough = handles[i].getNext();
+				if (fallthrough == null) continue;
+
+				// Pattern A: const, IF*  (single-operand integer conditionals)
+				if (i >= 1) {
+					Number v = getConstantValue(handles[i - 1].getInstruction(), cpgen);
+					if (v != null && supportsUnaryIntIf(ifInst)) {
+						boolean take = evaluateUnaryIntIf(v.intValue(), ifInst);
+						if (take) {
+							InstructionHandle gotoHandle = il.insert(handles[i - 1], new GOTO(target));
+							safeDelete(il, handles[i - 1], handles[i], gotoHandle);
+						} else {
+							safeDelete(il, handles[i - 1], handles[i], fallthrough);
+						}
+						changed = true;
+						changedAny = true;
+						break;
+					}
+				}
+
+				// Pattern B: const, const, IF_ICMP*
+				if (i >= 2) {
+					Number v1 = getConstantValue(handles[i - 2].getInstruction(), cpgen);
+					Number v2 = getConstantValue(handles[i - 1].getInstruction(), cpgen);
+					if (v1 != null && v2 != null && supportsIcmp(ifInst)) {
+						boolean take = evaluateIcmp(v1.intValue(), v2.intValue(), ifInst);
+						if (take) {
+							InstructionHandle gotoHandle = il.insert(handles[i - 2], new GOTO(target));
+							safeDelete(il, handles[i - 2], handles[i], gotoHandle);
+						} else {
+							safeDelete(il, handles[i - 2], handles[i], fallthrough);
+						}
+						changed = true;
+						changedAny = true;
+						break;
+					}
+				}
+			}
+		}
+
+		return changedAny;
+	}
+
+	private boolean supportsUnaryIntIf(IfInstruction ifInst) {
+		return ifInst instanceof IFEQ || ifInst instanceof IFNE ||
+				ifInst instanceof IFLT || ifInst instanceof IFLE ||
+				ifInst instanceof IFGT || ifInst instanceof IFGE;
+	}
+
+	private boolean evaluateUnaryIntIf(int value, IfInstruction ifInst) {
+		if (ifInst instanceof IFEQ) return value == 0;
+		if (ifInst instanceof IFNE) return value != 0;
+		if (ifInst instanceof IFLT) return value < 0;
+		if (ifInst instanceof IFLE) return value <= 0;
+		if (ifInst instanceof IFGT) return value > 0;
+		if (ifInst instanceof IFGE) return value >= 0;
+		return false;
+	}
+
+	private boolean supportsIcmp(IfInstruction ifInst) {
+		return ifInst instanceof IF_ICMPEQ || ifInst instanceof IF_ICMPNE ||
+				ifInst instanceof IF_ICMPLT || ifInst instanceof IF_ICMPLE ||
+				ifInst instanceof IF_ICMPGT || ifInst instanceof IF_ICMPGE;
+	}
+
+	private boolean evaluateIcmp(int left, int right, IfInstruction ifInst) {
+		if (ifInst instanceof IF_ICMPEQ) return left == right;
+		if (ifInst instanceof IF_ICMPNE) return left != right;
+		if (ifInst instanceof IF_ICMPLT) return left < right;
+		if (ifInst instanceof IF_ICMPLE) return left <= right;
+		if (ifInst instanceof IF_ICMPGT) return left > right;
+		if (ifInst instanceof IF_ICMPGE) return left >= right;
+		return false;
 	}
 
 	/**

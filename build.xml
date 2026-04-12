@@ -76,7 +76,9 @@
   <target name="generate" depends="compile.source" description="Jasmin generation of classfiles">
     <java classname="jasmin.Main">
       <classpath refid="library.classpath"/>
-      <arg line="${classes.dir}/comp0012/target/SimpleFolding.j -d ${classes.dir}"/>
+      <arg value="${classes.dir}/comp0012/target/SimpleFolding.j"/>
+      <arg value="-d"/>
+      <arg value="${classes.dir}"/>
     </java>
   </target>
   
@@ -129,7 +131,10 @@
     <mkdir dir="${optimised.dir}"/>
     <java classname="comp0012.main.Main">
       <classpath refid="test.original.classpath"/>
-      <arg line="-in ${classes.dir} -out ${optimised.dir}"/>
+      <arg value="-in"/>
+      <arg value="${classes.dir}"/>
+      <arg value="-out"/>
+      <arg value="${optimised.dir}"/>
     </java>
   </target>
   
