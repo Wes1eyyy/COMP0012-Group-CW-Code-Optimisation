@@ -227,6 +227,7 @@ public class ConstantFolder
 				if (propagateConstantVariables(il, cpgen)) changed = true;
 				if (propagateDynamicVariables(il, cpgen)) changed = true;
 				if (simplifyConstantBranches(il, cpgen)) changed = true;
+				if (eliminateDeadCode(il)) changed = true;
 				if (foldConstants(il, cpgen)) changed = true;
 				iterations++;
 			}
@@ -445,8 +446,155 @@ public class ConstantFolder
 	}
 
 	/**
-	 * SUBGOAL 4: Additional peephole optimisation.
+	 * SUBGOAL 4: Dead code elimination.
 	 *
+	 * Two passes:
+	 *  1. Unreachable instruction removal: delete instructions that follow an unconditional
+	 *     transfer (GOTO, *RETURN, ATHROW) and are not the target of any branch.
+	 *  2. Dead store elimination: if a STORE is never followed by a LOAD of the same
+	 *     variable index before the next STORE or end-of-method, remove the STORE and
+	 *     its preceding constant push (if any).
+	 *
+	 * Returns true if any changes were made.
+	 */
+	private boolean eliminateDeadCode(InstructionList il) {
+		boolean changedAny = false;
+
+		// --- Pass 1: unreachable instruction removal ---
+		boolean changed = true;
+		while (changed) {
+			changed = false;
+			InstructionHandle[] handles = il.getInstructionHandles();
+
+			// Collect all branch targets so we know which handles are reachable entry points
+			Set<InstructionHandle> branchTargets = new HashSet<>();
+			for (InstructionHandle h : handles) {
+				Instruction inst = h.getInstruction();
+				if (inst instanceof BranchInstruction) {
+					branchTargets.add(((BranchInstruction) inst).getTarget());
+					if (inst instanceof Select) {
+						for (InstructionHandle t : ((Select) inst).getTargets()) {
+							branchTargets.add(t);
+						}
+					}
+				}
+			}
+
+			for (int i = 0; i < handles.length - 1; i++) {
+				Instruction inst = handles[i].getInstruction();
+				boolean isUnconditionalTransfer =
+					inst instanceof GOTO ||
+					inst instanceof GOTO_W ||
+					inst instanceof ReturnInstruction ||
+					inst instanceof ATHROW;
+
+				if (!isUnconditionalTransfer) continue;
+
+				// Delete consecutive handles after this one that are not branch targets
+				InstructionHandle next = handles[i].getNext();
+				while (next != null && !branchTargets.contains(next)) {
+					InstructionHandle toDelete = next;
+					next = next.getNext();
+					try {
+						il.delete(toDelete);
+					} catch (TargetLostException e) {
+						// If something targeted this dead instruction, redirect to next live handle
+						InstructionHandle redirect = (next != null) ? next : handles[i];
+						for (InstructionHandle t : e.getTargets()) {
+							for (InstructionTargeter targeter : t.getTargeters()) {
+								targeter.updateTarget(t, redirect);
+							}
+						}
+					}
+					changed = true;
+					changedAny = true;
+				}
+				if (changed) break; // handles array is stale, restart
+			}
+		}
+
+		// --- Pass 2: dead store elimination ---
+		changed = true;
+		while (changed) {
+			changed = false;
+			InstructionHandle[] handles = il.getInstructionHandles();
+
+			for (int i = 0; i < handles.length; i++) {
+				Instruction inst = handles[i].getInstruction();
+				if (!(inst instanceof StoreInstruction)) continue;
+
+				int varIndex = ((StoreInstruction) inst).getIndex();
+
+				// Scan forward: is there a LOAD of varIndex before the next STORE of varIndex?
+				boolean hasLoad = false;
+				for (int j = i + 1; j < handles.length; j++) {
+					Instruction scan = handles[j].getInstruction();
+					if (scan instanceof LoadInstruction &&
+						((LoadInstruction) scan).getIndex() == varIndex) {
+						hasLoad = true;
+						break;
+					}
+					if (scan instanceof StoreInstruction &&
+						((StoreInstruction) scan).getIndex() == varIndex) {
+						break; // next store before any load — this store is dead
+					}
+					if (scan instanceof IINC &&
+						((IINC) scan).getIndex() == varIndex) {
+						hasLoad = true; // IINC reads and writes, counts as a use
+						break;
+					}
+				}
+
+				if (!hasLoad) {
+					// Dead store: delete the STORE and its preceding push if it's a constant
+					InstructionHandle storeHandle = handles[i];
+					InstructionHandle prev = storeHandle.getPrev();
+					InstructionHandle redirectTo = storeHandle.getNext() != null
+						? storeHandle.getNext() : storeHandle;
+
+					// Delete store first
+					try {
+						il.delete(storeHandle);
+					} catch (TargetLostException e) {
+						for (InstructionHandle t : e.getTargets()) {
+							for (InstructionTargeter targeter : t.getTargeters()) {
+								targeter.updateTarget(t, redirectTo);
+							}
+						}
+					}
+
+					// Delete preceding constant push only if it has no other targeters
+					// and is a pure constant (no side effects)
+					if (prev != null && prev.getTargeters().length == 0) {
+						Instruction prevInst = prev.getInstruction();
+						boolean isSafeToDelete =
+							prevInst instanceof ConstantPushInstruction ||
+							prevInst instanceof LDC ||
+							prevInst instanceof LDC2_W ||
+							prevInst instanceof LDC_W;
+						if (isSafeToDelete) {
+							try {
+								il.delete(prev);
+							} catch (TargetLostException e) {
+								// prev has no targeters (checked above), so this shouldn't happen
+							}
+						}
+					}
+
+					changed = true;
+					changedAny = true;
+					break; // handles array stale, restart
+				}
+			}
+		}
+
+		return changedAny;
+	}
+
+	/**
+	 * SUBGOAL 4: Additional peephole optimisation.
+	 * (Conditional Branches)
+	 * 
 	 * Simplify conditional branches whose operands are compile-time constants:
 	 *  - const, IF*            -> GOTO target (always true) or remove branch (always false)
 	 *  - const, const, IF_ICMP* -> GOTO target (always true) or remove branch (always false)

@@ -35,4 +35,14 @@ public class SimpleFoldingTest {
         assertEquals("12412" + System.lineSeparator(), outContent.toString());
     }
 
+    @Test
+    public void testDeadStore(){
+        assertEquals(200, sf.deadStore());
+    }
+
+    @Test
+    public void testAlwaysFalseBranchDeadCode(){
+        assertEquals(42, sf.alwaysFalseBranchDeadCode());
+    }
+
 }
